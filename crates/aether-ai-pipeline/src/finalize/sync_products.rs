@@ -11,6 +11,113 @@ use crate::conversion::response::{
     convert_openai_chat_response_to_openai_cli, convert_openai_cli_response_to_openai_chat,
 };
 use crate::conversion::{sync_chat_response_conversion_kind, sync_cli_response_conversion_kind};
+use crate::finalize::common::build_generated_tool_call_id;
+
+#[derive(Default)]
+struct OpenAICliMessageOutputState {
+    id: Option<String>,
+    parts: BTreeMap<usize, Value>,
+}
+
+#[derive(Default)]
+struct OpenAICliFunctionOutputState {
+    id: Option<String>,
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+#[derive(Default)]
+struct OpenAICliReasoningOutputState {
+    item: Option<Value>,
+}
+
+fn reconcile_buffer_with_done(buffer: &mut String, authoritative: &str) {
+    if authoritative.is_empty() {
+        return;
+    }
+    let missing = if authoritative.starts_with(buffer.as_str()) {
+        authoritative[buffer.len()..].to_string()
+    } else if buffer.as_str() == authoritative {
+        String::new()
+    } else {
+        authoritative.to_string()
+    };
+    if missing.is_empty() {
+        return;
+    }
+    if authoritative.starts_with(buffer.as_str()) {
+        buffer.push_str(&missing);
+    } else {
+        *buffer = authoritative.to_string();
+    }
+}
+
+fn ensure_output_text_part(state: &mut OpenAICliMessageOutputState, content_index: usize) {
+    state.parts.entry(content_index).or_insert_with(|| {
+        json!({
+            "type": "output_text",
+            "text": "",
+            "annotations": []
+        })
+    });
+}
+
+fn append_message_text_delta(
+    state: &mut OpenAICliMessageOutputState,
+    content_index: usize,
+    delta: &str,
+) {
+    if delta.is_empty() {
+        return;
+    }
+    ensure_output_text_part(state, content_index);
+    let Some(part) = state.parts.get_mut(&content_index).and_then(Value::as_object_mut) else {
+        return;
+    };
+    let current_text = part
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    part.insert(
+        "text".to_string(),
+        Value::String(format!("{current_text}{delta}")),
+    );
+    part.entry("annotations".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+}
+
+fn reconcile_message_text_part(
+    state: &mut OpenAICliMessageOutputState,
+    content_index: usize,
+    authoritative_text: &str,
+    template_part: Option<&Map<String, Value>>,
+) {
+    if authoritative_text.is_empty() {
+        return;
+    }
+    ensure_output_text_part(state, content_index);
+    let Some(part) = state.parts.get_mut(&content_index).and_then(Value::as_object_mut) else {
+        return;
+    };
+    if let Some(template_part) = template_part {
+        for (key, value) in template_part {
+            if key != "text" {
+                part.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let mut current_text = part
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    reconcile_buffer_with_done(&mut current_text, authoritative_text);
+    part.insert("text".to_string(), Value::String(current_text));
+    part.entry("annotations".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StandardCrossFormatSyncProduct {
@@ -963,33 +1070,359 @@ pub fn aggregate_openai_chat_stream_sync_response(body: &[u8]) -> Option<Value> 
 }
 
 pub fn aggregate_openai_cli_stream_sync_response(body: &[u8]) -> Option<Value> {
-    let text = std::str::from_utf8(body).ok()?;
+    let events = parse_stream_json_events(body)?;
+    if events.is_empty() {
+        return None;
+    }
 
-    for raw_line in text.lines() {
-        let line = raw_line.trim_matches('\r').trim();
-        if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
-            continue;
-        }
-        let Some(data_line) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let data_line = data_line.trim();
-        if data_line.is_empty() || data_line == "[DONE]" {
-            continue;
-        }
+    let mut completed_response: Option<Map<String, Value>> = None;
+    let mut message_outputs: BTreeMap<usize, OpenAICliMessageOutputState> = BTreeMap::new();
+    let mut function_outputs: BTreeMap<usize, OpenAICliFunctionOutputState> = BTreeMap::new();
+    let mut reasoning_outputs: BTreeMap<usize, OpenAICliReasoningOutputState> = BTreeMap::new();
+    let mut function_index_by_key: BTreeMap<String, usize> = BTreeMap::new();
 
-        let event: Value = serde_json::from_str(data_line).ok()?;
-        let event_type = event
+    for event in events {
+        let event_object = event.as_object()?;
+        let event_type = event_object
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if event_type == "response.completed" {
-            let response = event.get("response")?.as_object()?.clone();
-            return Some(Value::Object(response));
+
+        match event_type {
+            "response.completed" => {
+                completed_response = event
+                    .get("response")
+                    .and_then(Value::as_object)
+                    .cloned();
+            }
+            "response.output_text.delta" => {
+                let index = event_object
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(0);
+                let content_index = event_object
+                    .get("content_index")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(0);
+                let delta = event_object
+                    .get("delta")
+                    .and_then(|value| match value {
+                        Value::String(text) => Some(text.as_str()),
+                        Value::Object(object) => object.get("text").and_then(Value::as_str),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                if !delta.is_empty() {
+                    append_message_text_delta(
+                        message_outputs.entry(index).or_default(),
+                        content_index,
+                        delta,
+                    );
+                }
+            }
+            "response.output_text.done" => {
+                let index = event_object
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(0);
+                let content_index = event_object
+                    .get("content_index")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(0);
+                let part_template = event_object.get("part").and_then(Value::as_object);
+                let text = event_object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        event_object
+                            .get("part")
+                            .and_then(Value::as_object)
+                            .and_then(|part| part.get("text"))
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    reconcile_message_text_part(
+                        message_outputs.entry(index).or_default(),
+                        content_index,
+                        text,
+                        part_template,
+                    );
+                }
+            }
+            "response.content_part.added" | "response.content_part.done" => {
+                let index = event_object
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(0);
+                let content_index = event_object
+                    .get("content_index")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(0);
+                let part_template = event_object.get("part").and_then(Value::as_object);
+                if let Some(part_template) = part_template {
+                    if part_template.get("type").and_then(Value::as_str) == Some("output_text") {
+                        let text = part_template
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !text.is_empty() {
+                            reconcile_message_text_part(
+                                message_outputs.entry(index).or_default(),
+                                content_index,
+                                text,
+                                Some(part_template),
+                            );
+                        } else {
+                            message_outputs
+                                .entry(index)
+                                .or_default()
+                                .parts
+                                .entry(content_index)
+                                .or_insert_with(|| Value::Object(part_template.clone()));
+                        }
+                    } else {
+                        message_outputs
+                            .entry(index)
+                            .or_default()
+                            .parts
+                            .insert(content_index, Value::Object(part_template.clone()));
+                    }
+                }
+            }
+            "response.output_item.added" | "response.output_item.done" => {
+                let index = event_object
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(0);
+                let Some(item) = event_object.get("item").and_then(Value::as_object) else {
+                    continue;
+                };
+                match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+                    "message" => {
+                        let state = message_outputs.entry(index).or_default();
+                        state.id = item.get("id").and_then(Value::as_str).map(ToOwned::to_owned);
+                        if let Some(content) = item.get("content").and_then(Value::as_array) {
+                            for (content_index, part) in content.iter().enumerate() {
+                                let Some(part_object) = part.as_object() else {
+                                    continue;
+                                };
+                                if part_object.get("type").and_then(Value::as_str)
+                                    == Some("output_text")
+                                {
+                                    if let Some(text) = part_object.get("text").and_then(Value::as_str)
+                                    {
+                                        reconcile_message_text_part(
+                                            state,
+                                            content_index,
+                                            text,
+                                            Some(part_object),
+                                        );
+                                    }
+                                } else {
+                                    state
+                                        .parts
+                                        .entry(content_index)
+                                        .or_insert_with(|| Value::Object(part_object.clone()));
+                                }
+                            }
+                        }
+                    }
+                    "function_call" => {
+                        let state = function_outputs.entry(index).or_default();
+                        state.id = item.get("id").and_then(Value::as_str).map(ToOwned::to_owned);
+                        state.call_id = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .or_else(|| state.call_id.clone());
+                        state.name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .or_else(|| state.name.clone());
+                        if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
+                            reconcile_buffer_with_done(&mut state.arguments, arguments);
+                        }
+                        for key in [
+                            item.get("item_id").and_then(Value::as_str),
+                            item.get("call_id").and_then(Value::as_str),
+                            item.get("id").and_then(Value::as_str),
+                        ] {
+                            if let Some(key) = key {
+                                function_index_by_key.insert(key.to_string(), index);
+                            }
+                        }
+                    }
+                    "reasoning" => {
+                        reasoning_outputs.entry(index).or_default().item = Some(Value::Object(item.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let index = event_object
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .or_else(|| {
+                        event_object
+                            .get("item_id")
+                            .and_then(Value::as_str)
+                            .and_then(|key| function_index_by_key.get(key).copied())
+                    })
+                    .unwrap_or(0);
+                let delta = event_object
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !delta.is_empty() {
+                    function_outputs
+                        .entry(index)
+                        .or_default()
+                        .arguments
+                        .push_str(delta);
+                }
+            }
+            "response.function_call_arguments.done" => {
+                let index = event_object
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .or_else(|| {
+                        event_object
+                            .get("item_id")
+                            .and_then(Value::as_str)
+                            .and_then(|key| function_index_by_key.get(key).copied())
+                    })
+                    .unwrap_or(0);
+                let state = function_outputs.entry(index).or_default();
+                if let Some(item) = event_object.get("item").and_then(Value::as_object) {
+                    state.id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .or_else(|| state.id.clone());
+                    state.call_id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .or_else(|| state.call_id.clone());
+                    state.name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .or_else(|| state.name.clone());
+                    for key in [
+                        item.get("item_id").and_then(Value::as_str),
+                        item.get("call_id").and_then(Value::as_str),
+                        item.get("id").and_then(Value::as_str),
+                    ] {
+                        if let Some(key) = key {
+                            function_index_by_key.insert(key.to_string(), index);
+                        }
+                    }
+                }
+                let arguments = event_object
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        event_object
+                            .get("item")
+                            .and_then(Value::as_object)
+                            .and_then(|item| item.get("arguments"))
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or_default();
+                if !arguments.is_empty() {
+                    reconcile_buffer_with_done(&mut state.arguments, arguments);
+                }
+            }
+            _ => {}
         }
     }
 
-    None
+    let mut response = completed_response?;
+    if response
+        .get("output")
+        .and_then(Value::as_array)
+        .is_some_and(|output| !output.is_empty())
+    {
+        return Some(Value::Object(response));
+    }
+
+    let mut rebuilt_output = Vec::new();
+    let mut all_indexes = BTreeMap::new();
+    for index in message_outputs.keys() {
+        all_indexes.insert(*index, ());
+    }
+    for index in function_outputs.keys() {
+        all_indexes.insert(*index, ());
+    }
+    for index in reasoning_outputs.keys() {
+        all_indexes.insert(*index, ());
+    }
+
+    for (index, _) in all_indexes {
+        if let Some(tool_state) = function_outputs.get(&index) {
+            if tool_state.call_id.is_some()
+                || tool_state.name.is_some()
+                || !tool_state.arguments.is_empty()
+            {
+                let call_id = tool_state
+                    .call_id
+                    .clone()
+                    .or_else(|| tool_state.id.clone())
+                    .unwrap_or_else(|| build_generated_tool_call_id(index));
+                rebuilt_output.push(json!({
+                    "type": "function_call",
+                    "id": tool_state.id.clone().unwrap_or_else(|| call_id.clone()),
+                    "call_id": call_id,
+                    "name": tool_state.name.clone().unwrap_or_else(|| "unknown".to_string()),
+                    "arguments": tool_state.arguments,
+                    "status": "completed"
+                }));
+                continue;
+            }
+        }
+
+        if let Some(reasoning_state) = reasoning_outputs.get(&index) {
+            if let Some(item) = &reasoning_state.item {
+                rebuilt_output.push(item.clone());
+                continue;
+            }
+        }
+
+        if let Some(message_state) = message_outputs.get(&index) {
+            if !message_state.parts.is_empty() {
+                let mut message = Map::new();
+                message.insert("type".to_string(), Value::String("message".to_string()));
+                if let Some(id) = &message_state.id {
+                    message.insert("id".to_string(), Value::String(id.clone()));
+                }
+                message.insert("role".to_string(), Value::String("assistant".to_string()));
+                message.insert("status".to_string(), Value::String("completed".to_string()));
+                message.insert(
+                    "content".to_string(),
+                    Value::Array(message_state.parts.values().cloned().collect()),
+                );
+                rebuilt_output.push(Value::Object(message));
+            }
+        }
+    }
+
+    if !rebuilt_output.is_empty() {
+        response.insert("output".to_string(), Value::Array(rebuilt_output));
+    }
+
+    Some(Value::Object(response))
 }
 
 pub fn aggregate_claude_stream_sync_response(body: &[u8]) -> Option<Value> {
@@ -1231,6 +1664,7 @@ pub fn aggregate_gemini_stream_sync_response(body: &[u8]) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
+        aggregate_openai_cli_stream_sync_response,
         maybe_build_openai_chat_cross_format_sync_product_from_normalized_payload,
         maybe_build_openai_cli_cross_format_sync_product_from_normalized_payload,
         maybe_build_openai_cli_same_family_sync_body_from_normalized_payload,
@@ -1474,6 +1908,16 @@ mod tests {
         let body = concat!(
             "event: response.created\n",
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_123\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_123\",\"call_id\":\"call_weather\",\"name\":\"get_weather\",\"status\":\"in_progress\",\"arguments\":\"\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_123\",\"delta\":\"{\\\"location\\\":\"}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_123\",\"delta\":\" \\\"Tokyo\\\"}\"}\n\n",
             "event: response.completed\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
         );
@@ -1495,6 +1939,145 @@ mod tests {
 
         assert_eq!(body_json.get("id"), Some(&json!("resp_123")));
         assert_eq!(body_json.get("status"), Some(&json!("completed")));
+        assert_eq!(body_json["output"][0]["type"], "message");
+        assert_eq!(body_json["output"][0]["content"][0]["text"], "Hello");
+        assert_eq!(body_json["output"][1]["type"], "function_call");
+        assert_eq!(body_json["output"][1]["name"], "get_weather");
+        assert_eq!(body_json["output"][1]["arguments"], r#"{"location": "Tokyo"}"#);
+    }
+
+    #[test]
+    fn preserves_openai_cli_completed_output_when_already_present() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Ignored\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_preserve_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"msg_preserve_123\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Authoritative\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
+        );
+
+        let result = aggregate_openai_cli_stream_sync_response(body.as_bytes())
+            .expect("openai-cli stream should aggregate into a sync body");
+
+        assert_eq!(result["output"][0]["content"][0]["text"], "Authoritative");
+    }
+
+    #[test]
+    fn reconstructs_openai_cli_output_from_content_part_and_done_events() {
+        let body = concat!(
+            "event: response.content_part.added\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"Hel\"}}\n\n",
+            "event: response.output_text.done\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"Hello\"}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_done_123\",\"delta\":\"{\\\"location\\\":\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":1,\"item_id\":\"fc_done_123\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_done_123\",\"call_id\":\"call_done_weather\",\"name\":\"get_weather\",\"arguments\":\"{\\\"location\\\": \\\"Tokyo\\\"}\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_done_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+
+        let result = aggregate_openai_cli_stream_sync_response(body.as_bytes())
+            .expect("openai-cli stream should aggregate into a sync body");
+
+        assert_eq!(result["output"][0]["content"][0]["text"], "Hello");
+        assert_eq!(result["output"][1]["type"], "function_call");
+        assert_eq!(result["output"][1]["call_id"], "call_done_weather");
+        assert_eq!(result["output"][1]["arguments"], r#"{"location": "Tokyo"}"#);
+    }
+
+    #[test]
+    fn preserves_openai_cli_multi_part_message_content_order() {
+        let body = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_multi_123\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+            "event: response.content_part.added\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"Hello\",\"annotations\":[]}}\n\n",
+            "event: response.content_part.added\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":1,\"part\":{\"type\":\"output_text\",\"text\":\" world\",\"annotations\":[]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_multi_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+
+        let result = aggregate_openai_cli_stream_sync_response(body.as_bytes())
+            .expect("openai-cli stream should aggregate into a sync body");
+
+        assert_eq!(result["output"][0]["type"], "message");
+        assert_eq!(result["output"][0]["content"][0]["text"], "Hello");
+        assert_eq!(result["output"][0]["content"][1]["text"], " world");
+    }
+
+    #[test]
+    fn preserves_openai_cli_non_text_content_parts() {
+        let body = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_non_text_123\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+            "event: response.content_part.done\n",
+            "data: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"refusal\",\"refusal\":\"blocked\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_non_text_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+
+        let result = aggregate_openai_cli_stream_sync_response(body.as_bytes())
+            .expect("openai-cli stream should aggregate into a sync body");
+
+        assert_eq!(result["output"][0]["content"][0]["type"], "refusal");
+        assert_eq!(result["output"][0]["content"][0]["refusal"], "blocked");
+    }
+
+    #[test]
+    fn output_item_done_reconciles_authoritative_function_arguments() {
+        let body = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_auth_123\",\"call_id\":\"call_auth_weather\",\"name\":\"get_weather\",\"status\":\"in_progress\",\"arguments\":\"\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_auth_123\",\"delta\":\"{\\\"location\\\":\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_auth_123\",\"call_id\":\"call_auth_weather\",\"name\":\"get_weather\",\"status\":\"completed\",\"arguments\":\"{\\\"location\\\": \\\"Tokyo\\\"}\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_auth_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+
+        let result = aggregate_openai_cli_stream_sync_response(body.as_bytes())
+            .expect("openai-cli stream should aggregate into a sync body");
+
+        assert_eq!(result["output"][0]["type"], "function_call");
+        assert_eq!(result["output"][0]["call_id"], "call_auth_weather");
+        assert_eq!(result["output"][0]["arguments"], r#"{"location": "Tokyo"}"#);
+    }
+
+    #[test]
+    fn preserves_openai_cli_reasoning_output_items() {
+        let body = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_123\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"because\"}]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_reasoning_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+
+        let result = aggregate_openai_cli_stream_sync_response(body.as_bytes())
+            .expect("openai-cli stream should aggregate into a sync body");
+
+        assert_eq!(result["output"][0]["type"], "reasoning");
+        assert_eq!(result["output"][0]["summary"][0]["text"], "because");
+    }
+
+    #[test]
+    fn authoritative_output_text_done_preserves_annotations() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\n",
+            "event: response.output_text.done\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"Hello\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"https://example.com\"}]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_annotations_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+
+        let result = aggregate_openai_cli_stream_sync_response(body.as_bytes())
+            .expect("openai-cli stream should aggregate into a sync body");
+
+        assert_eq!(result["output"][0]["content"][0]["text"], "Hello");
+        assert_eq!(result["output"][0]["content"][0]["annotations"][0]["type"], "url_citation");
+        assert_eq!(result["output"][0]["content"][0]["annotations"][0]["url"], "https://example.com");
     }
 
     #[test]

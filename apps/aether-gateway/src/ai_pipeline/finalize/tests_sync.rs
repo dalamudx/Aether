@@ -178,7 +178,16 @@ fn aggregates_openai_cli_stream_completed_event_to_final_response() {
             "object": "response",
             "model": "gpt-5",
             "status": "completed",
-            "output": [],
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": "Hello",
+                    "annotations": []
+                }]
+            }],
             "usage": {
                 "input_tokens": 1,
                 "output_tokens": 2,

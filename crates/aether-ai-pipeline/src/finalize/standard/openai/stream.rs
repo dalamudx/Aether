@@ -568,7 +568,7 @@ impl OpenAICliProviderState {
             "response.created" | "response.in_progress" => {
                 self.ensure_started(report_context, &mut out);
             }
-            "response.output_text.delta" => {
+            "response.output_text.delta" | "response.outtext.delta" => {
                 let piece = match value.get("delta") {
                     Some(Value::String(text)) => text.clone(),
                     Some(Value::Object(delta)) => delta
@@ -1021,6 +1021,24 @@ impl OpenAIChatClientEmitter {
                             "finish_reason": Value::Null
                         }]
                     }),
+                )?);
+                Ok(out)
+            }
+            CanonicalStreamEvent::ReasoningSignature(_) => Ok(Vec::new()),
+            CanonicalStreamEvent::ContentPart(part) => {
+                let placeholder = openai_stream_placeholder_for_content_part(&part);
+                let mut out = self.ensure_started()?;
+                out.extend(encode_json_sse(
+                    None,
+                    &build_openai_chat_chunk(
+                        self.response_id
+                            .as_deref()
+                            .unwrap_or("chatcmpl-local-stream"),
+                        self.model.as_deref().unwrap_or("unknown"),
+                        placeholder,
+                        None,
+                        None,
+                    ),
                 )?);
                 Ok(out)
             }
@@ -1602,6 +1620,24 @@ impl OpenAICliClientEmitter {
                 )?);
                 Ok(out)
             }
+            CanonicalStreamEvent::ReasoningSignature(_) => Ok(Vec::new()),
+            CanonicalStreamEvent::ContentPart(part) => {
+                let placeholder = openai_stream_placeholder_for_content_part(&part);
+                let mut out = self.ensure_text_item_started()?;
+                self.text.push_str(&placeholder);
+                out.extend(self.encode_response_event(
+                    "response.output_text.delta",
+                    json!({
+                        "type": "response.output_text.delta",
+                        "response_id": self.response_id(),
+                        "output_index": self.message_output_index.unwrap_or(0),
+                        "item_id": self.message_item_id(),
+                        "content_index": 0,
+                        "delta": placeholder,
+                    }),
+                )?);
+                Ok(out)
+            }
             CanonicalStreamEvent::ToolCallStart {
                 index,
                 call_id,
@@ -1712,6 +1748,30 @@ impl OpenAICliClientEmitter {
                 usage: None,
             },
         })
+    }
+}
+
+fn openai_stream_placeholder_for_content_part(part: &CanonicalContentPart) -> String {
+    match part {
+        CanonicalContentPart::ImageUrl(url) => {
+            if url.starts_with("data:") {
+                "[Image]".to_string()
+            } else {
+                format!("[Image: {url}]")
+            }
+        }
+        CanonicalContentPart::File {
+            reference,
+            mime_type,
+            filename,
+            ..
+        } => reference
+            .as_ref()
+            .map(|value| format!("[File: {value}]"))
+            .or_else(|| filename.as_ref().map(|value| format!("[File: {value}]")))
+            .or_else(|| mime_type.as_ref().map(|value| format!("[File: {value}]")))
+            .unwrap_or_else(|| "[File]".to_string()),
+        CanonicalContentPart::Audio { format, .. } => format!("[Audio: {format}]"),
     }
 }
 
@@ -1910,6 +1970,48 @@ mod tests {
     }
 
     #[test]
+    fn openai_cli_provider_state_accepts_legacy_outtext_delta_alias() {
+        let mut state = OpenAICliProviderState::default();
+        let report_context = json!({});
+        let mut frames = Vec::new();
+
+        frames.extend(
+            state
+                .push_line(
+                    &report_context,
+                    data_line(json!({
+                        "type": "response.created",
+                        "response": {
+                            "id": "resp_legacy_123",
+                            "model": "gpt-5.4",
+                        }
+                    })),
+                )
+                .expect("created should parse"),
+        );
+        frames.extend(
+            state
+                .push_line(
+                    &report_context,
+                    data_line(json!({
+                        "type": "response.outtext.delta",
+                        "response_id": "resp_legacy_123",
+                        "output_index": 0,
+                        "item_id": "resp_legacy_123_msg",
+                        "content_index": 0,
+                        "delta": "Hello from legacy alias",
+                    })),
+                )
+                .expect("legacy text delta should parse"),
+        );
+
+        assert!(frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::TextDelta(ref text) if text == "Hello from legacy alias"
+        )));
+    }
+
+    #[test]
     fn openai_chat_client_emitter_emits_reasoning_content_chunks() {
         let mut emitter = OpenAIChatClientEmitter::default();
         let mut bytes = emitter
@@ -1931,6 +2033,23 @@ mod tests {
 
         let sse = String::from_utf8(bytes).expect("sse should be utf8");
         assert!(sse.contains("\"reasoning_content\":\"because\""));
+    }
+
+    #[test]
+    fn openai_chat_client_emitter_renders_image_parts_as_placeholder() {
+        let mut emitter = OpenAIChatClientEmitter::default();
+        let bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "chatcmpl_img_123".to_string(),
+                model: "gpt-5.4".to_string(),
+                event: CanonicalStreamEvent::ContentPart(CanonicalContentPart::ImageUrl(
+                    "data:image/png;base64,iVBORw0KGgo=".to_string(),
+                )),
+            })
+            .expect("image should encode");
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        assert!(sse.contains("[Image]"));
     }
 
     #[test]

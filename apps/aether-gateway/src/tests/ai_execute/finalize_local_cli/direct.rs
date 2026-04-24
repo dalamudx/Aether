@@ -389,6 +389,7 @@ async fn gateway_executes_openai_cli_sync_upstream_stream_via_local_finalize_res
             "status": "completed",
             "output": [{
                 "type": "message",
+                "id": "resp_stream_001_msg",
                 "role": "assistant",
                 "status": "completed",
                 "content": [{

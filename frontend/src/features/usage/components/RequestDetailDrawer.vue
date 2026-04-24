@@ -54,11 +54,24 @@
                   {{ detail.status_code }}
                 </Badge>
                 <Badge
-                  v-if="detail"
-                  variant="outline"
-                  class="text-xs"
+                  v-if="detail && resolveUsageStreamLabelSegments(detail).hasConversion"
+                  :variant="resolveUsageStreamLabelSegments(detail).client === '流式' ? 'secondary' : 'outline'"
+                  :class="resolveUsageStreamLabelSegments(detail).client === '流式'
+                    ? 'text-xs inline-flex items-center gap-1'
+                    : 'text-xs inline-flex items-center gap-1 border-border/60 text-muted-foreground'"
                 >
-                  {{ detail ? formatUsageStreamLabel(detail) : '标准' }}
+                  <span>{{ resolveUsageStreamLabelSegments(detail).client }}</span>
+                  <span class="opacity-60">→</span>
+                  <span>{{ resolveUsageStreamLabelSegments(detail).upstream }}</span>
+                </Badge>
+                <Badge
+                  v-else-if="detail"
+                  :variant="isUsageUpstreamStream(detail) ? 'secondary' : 'outline'"
+                  :class="isUsageUpstreamStream(detail)
+                    ? 'text-xs'
+                    : 'text-xs border-border/60 text-muted-foreground'"
+                >
+                  {{ formatUsageStreamLabel(detail) }}
                 </Badge>
               </div>
               <div class="flex items-center gap-1 shrink-0">
@@ -398,6 +411,7 @@
                   ref="timelineRef"
                   :request-id="detail.request_id || detail.id"
                   :override-status-code="detail.status_code"
+                  :request-status="detail.status"
                   :request-api-format="detail.api_format || null"
                   :request-metadata="traceRequestMetadata"
                 />
@@ -695,7 +709,12 @@ import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { formatShortRequestId } from '@/utils/format'
 import { log } from '@/utils/logger'
 import { getEffectiveInputTokens } from '../token-normalization'
-import { formatUsageStreamLabel } from '../utils/status'
+import {
+  formatUsageStreamLabel,
+  isUsageUpstreamStream,
+  resolveDisplayRequestStatus,
+  resolveUsageStreamLabelSegments,
+} from '../utils/status'
 
 // 子组件
 import RequestHeadersContent from './RequestDetailDrawer/RequestHeadersContent.vue'
@@ -1749,7 +1768,8 @@ function handleClose() {
 
 function isRequestCompleted(): boolean {
   if (!detail.value?.status) return true
-  return !['pending', 'streaming'].includes(detail.value.status)
+  const displayStatus = resolveDisplayRequestStatus(detail.value)
+  return displayStatus !== 'pending' && displayStatus !== 'streaming'
 }
 
 function stopAutoRefresh() {

@@ -309,6 +309,10 @@ import {
 } from '@/api/endpoints'
 import { parseApiError } from '@/utils/errorParser'
 import { parseNumberInput } from '@/utils/form'
+import {
+  buildQuotaPayloadForBillingType,
+  toDatetimeLocalValue,
+} from '@/features/providers/utils/providerBillingPayload'
 
 const props = defineProps<{
   modelValue: boolean
@@ -403,10 +407,8 @@ function loadProviderData() {
     billing_type: (props.provider.billing_type as 'monthly_quota' | 'pay_as_you_go' | 'free_tier') || 'pay_as_you_go',
     monthly_quota_usd: props.provider.monthly_quota_usd || undefined,
     quota_reset_day: props.provider.quota_reset_day || 30,
-    quota_last_reset_at: props.provider.quota_last_reset_at ?
-      new Date(props.provider.quota_last_reset_at).toISOString().slice(0, 16) : '',
-    quota_expires_at: props.provider.quota_expires_at ?
-      new Date(props.provider.quota_expires_at).toISOString().slice(0, 16) : '',
+    quota_last_reset_at: toDatetimeLocalValue(props.provider.quota_last_reset_at),
+    quota_expires_at: toDatetimeLocalValue(props.provider.quota_expires_at),
     provider_priority: props.provider.provider_priority || 999,
     keep_priority_on_conversion: props.provider.keep_priority_on_conversion ?? false,
     is_active: props.provider.is_active,
@@ -455,16 +457,14 @@ const handleSubmit = async () => {
   loading.value = true
   try {
     const currentPoolAdvanced = normalizePoolAdvancedConfig(props.provider?.pool_advanced)
+    const quotaPayload = buildQuotaPayloadForBillingType(form.value)
     const basePayload = {
       name: form.value.name,
       provider_type: form.value.provider_type,
       description: form.value.description || undefined,
       website: form.value.website || undefined,
       billing_type: form.value.billing_type,
-      monthly_quota_usd: form.value.monthly_quota_usd,
-      quota_reset_day: form.value.quota_reset_day,
-      quota_last_reset_at: form.value.quota_last_reset_at || undefined,
-      quota_expires_at: form.value.quota_expires_at || undefined,
+      ...quotaPayload,
       keep_priority_on_conversion: form.value.keep_priority_on_conversion,
       is_active: form.value.is_active,
       // 请求配置

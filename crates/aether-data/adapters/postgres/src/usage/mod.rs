@@ -3711,14 +3711,15 @@ FROM "#,
 
     async fn summarize_usage_audits_raw(
         &self,
-        created_from_unix_secs: u64,
-        created_until_unix_secs: u64,
-        user_id: Option<&str>,
-        user_ids: Option<&[String]>,
-        provider_names: Option<&[String]>,
-        provider_name: Option<&str>,
-        model: Option<&str>,
+        query: &UsageAuditSummaryQuery,
     ) -> Result<StoredUsageAuditSummary, DataLayerError> {
+        let created_from_unix_secs = query.created_from_unix_secs;
+        let created_until_unix_secs = query.created_until_unix_secs;
+        let user_id = query.user_id.as_deref();
+        let user_ids = query.user_ids.as_deref();
+        let provider_names = query.provider_names.as_deref();
+        let provider_name = query.provider_name.as_deref();
+        let model = query.model.as_deref();
         if created_from_unix_secs >= created_until_unix_secs {
             return Ok(StoredUsageAuditSummary::default());
         }
@@ -3807,62 +3808,28 @@ FROM usage_billing_facts AS "usage"
         // Keep these scopes on canonical facts rather than inventing missing daily totals.
         if query.provider_names.is_some() || query.provider_name.is_some() || query.model.is_some()
         {
-            return self
-                .summarize_usage_audits_raw(
-                    query.created_from_unix_secs,
-                    query.created_until_unix_secs,
-                    query.user_id.as_deref(),
-                    query.user_ids.as_deref(),
-                    query.provider_names.as_deref(),
-                    query.provider_name.as_deref(),
-                    query.model.as_deref(),
-                )
-                .await;
+            return self.summarize_usage_audits_raw(query).await;
         }
         let Some(cutoff_utc) = self.read_stats_daily_cutoff_date().await? else {
-            return self
-                .summarize_usage_audits_raw(
-                    query.created_from_unix_secs,
-                    query.created_until_unix_secs,
-                    query.user_id.as_deref(),
-                    query.user_ids.as_deref(),
-                    query.provider_names.as_deref(),
-                    None,
-                    None,
-                )
-                .await;
+            return self.summarize_usage_audits_raw(query).await;
         };
 
         let start_utc = dashboard_unix_secs_to_utc(query.created_from_unix_secs);
         let end_utc = dashboard_unix_secs_to_utc(query.created_until_unix_secs);
         let split = split_dashboard_daily_aggregate_range(start_utc, end_utc, cutoff_utc);
         let Some(_) = split.aggregate else {
-            return self
-                .summarize_usage_audits_raw(
-                    query.created_from_unix_secs,
-                    query.created_until_unix_secs,
-                    query.user_id.as_deref(),
-                    query.user_ids.as_deref(),
-                    query.provider_names.as_deref(),
-                    None,
-                    None,
-                )
-                .await;
+            return self.summarize_usage_audits_raw(query).await;
         };
 
         let mut summary = StoredUsageAuditSummary::default();
         if let Some((raw_start, raw_end)) = split.raw_leading {
             absorb_usage_audit_summary(
                 &mut summary,
-                self.summarize_usage_audits_raw(
-                    dashboard_utc_to_unix_secs(raw_start),
-                    dashboard_utc_to_unix_secs(raw_end),
-                    query.user_id.as_deref(),
-                    query.user_ids.as_deref(),
-                    query.provider_names.as_deref(),
-                    None,
-                    None,
-                )
+                self.summarize_usage_audits_raw(&UsageAuditSummaryQuery {
+                    created_from_unix_secs: dashboard_utc_to_unix_secs(raw_start),
+                    created_until_unix_secs: dashboard_utc_to_unix_secs(raw_end),
+                    ..query.clone()
+                })
                 .await?,
             );
         }
@@ -3881,15 +3848,11 @@ FROM usage_billing_facts AS "usage"
         if let Some((raw_start, raw_end)) = split.raw_trailing {
             absorb_usage_audit_summary(
                 &mut summary,
-                self.summarize_usage_audits_raw(
-                    dashboard_utc_to_unix_secs(raw_start),
-                    dashboard_utc_to_unix_secs(raw_end),
-                    query.user_id.as_deref(),
-                    query.user_ids.as_deref(),
-                    query.provider_names.as_deref(),
-                    None,
-                    None,
-                )
+                self.summarize_usage_audits_raw(&UsageAuditSummaryQuery {
+                    created_from_unix_secs: dashboard_utc_to_unix_secs(raw_start),
+                    created_until_unix_secs: dashboard_utc_to_unix_secs(raw_end),
+                    ..query.clone()
+                })
                 .await?,
             );
         }
